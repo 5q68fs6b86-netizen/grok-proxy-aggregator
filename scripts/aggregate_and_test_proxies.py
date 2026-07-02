@@ -305,11 +305,22 @@ def kill_port(port: int) -> None:
     """Kill process listening on port."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('127.0.0.1', port))
         s.close()
+        return  # Port is free
     except OSError:
-        subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
-        time.sleep(1)
+        pass
+    # Port in use, try to kill
+    for cmd in [["fuser", "-k", f"{port}/tcp"], ["lsof", "-ti", f":{port}"]]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if cmd[0] == "lsof" and r.stdout.strip():
+                for pid in r.stdout.strip().split():
+                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=3)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    time.sleep(1)
 
 
 def is_port_open(port: int, timeout: float = 1.0) -> bool:
@@ -376,10 +387,12 @@ def run_mihomo_batch(
     kill_port(api_port)
 
     # Start mihomo daemon
+    log_path = f"/tmp/mihomo_batch_{port}.log"
+    log_f = open(log_path, "w")
     proc = subprocess.Popen(
         ["mihomo", "-f", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
     )
 
     latency_map: dict[str, int] = {}
@@ -387,12 +400,17 @@ def run_mihomo_batch(
     try:
         # Wait for mihomo to start (check API port)
         started = False
-        for _ in range(20):
+        for _ in range(40):
             if proc.poll() is not None:
-                err = proc.stderr.read().decode() if proc.stderr else ""
+                log_f.flush()
+                try:
+                    with open(log_path) as lf:
+                        err = lf.read()[-1000:]
+                except Exception:
+                    err = ""
                 print(f"    [WARN] Mihomo exited with code {proc.returncode}")
-                if err:
-                    print(f"    [WARN] stderr: {err[-500:]}")
+                if err.strip():
+                    print(f"    [WARN] log: {err.strip()}")
                 return {}
             if is_port_open(api_port):
                 started = True
@@ -400,7 +418,7 @@ def run_mihomo_batch(
             time.sleep(0.5)
 
         if not started:
-            print(f"    [WARN] Mihomo API port {api_port} not open after 10s")
+            print(f"    [WARN] Mihomo API port {api_port} not open after 20s")
             proc.terminate()
             return {}
 

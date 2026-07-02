@@ -132,7 +132,7 @@ jobs:
             --batch-size "$BATCH"
 
           if [ -f config.yaml ]; then
-            AVAIL=$(grep -c "^  - name:" config.yaml 2>/dev/null || echo 0)
+            AVAIL=$(python3 -c "import yaml; print(len(yaml.safe_load(open('config.yaml')).get('proxies',[])))" 2>/dev/null || echo 0)
             echo "available=$AVAIL" >> "$GITHUB_OUTPUT"
             echo "✅ $AVAIL proxies passed latency test"
           else
