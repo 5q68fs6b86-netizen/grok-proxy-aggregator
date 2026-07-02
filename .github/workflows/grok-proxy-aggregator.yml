@@ -1,0 +1,199 @@
+name: Grok Proxy Aggregator
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Grok API base URL'
+        default: 'https://jiuuij.de5.net/v1'
+      model:
+        description: 'Grok model name'
+        default: 'grok-4.20-multi-agent-xhigh'
+      max_proxies:
+        description: 'Max proxies to test (0=all)'
+        default: '0'
+      latency_threshold:
+        description: 'Max latency (ms) to keep proxy'
+        default: '500'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  R2_ACCOUNT_ID: "6ebc3ef97b0aca55c0f4660685627750"
+  R2_BUCKET: "config"
+  R2_KEY: "config.yaml"
+
+jobs:
+  fetch-yaml:
+    name: Fetch YAML URLs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      valid_urls: ${{ steps.grok.outputs.valid_urls }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install requests pyyaml
+
+      - name: Run Grok script
+        id: grok
+        env:
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          BASE_URL="${{ github.event.inputs.base_url || 'https://jiuuij.de5.net/v1' }}"
+          MODEL="${{ github.event.inputs.model || 'grok-4.20-multi-agent-xhigh' }}"
+
+          python3 grok_authorized_yaml_report.py \
+            --base-url "$BASE_URL" \
+            --model "$MODEL" \
+            --no-host-filter \
+            --prompt-file searchprompt.txt \
+            --out report.csv \
+            --timeout 120
+
+          VALID=$(awk -F',' 'NR>1 && $2=="True" && $3=="200"' report.csv | wc -l)
+          echo "valid_urls=$VALID" >> "$GITHUB_OUTPUT"
+          echo "✅ Found $VALID valid YAML URLs"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-report
+          path: report.csv
+          retention-days: 7
+
+  aggregate-test-upload:
+    name: Aggregate → Mihomo Test → Upload R2
+    needs: fetch-yaml
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install requests pyyaml boto3
+
+      - name: Install mihomo
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          echo "Installing mihomo $VERSION..."
+          wget -q "https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/mihomo-linux-amd64-${VERSION}.gz" -O mihomo.gz
+          gunzip mihomo.gz
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+          mihomo -v
+
+      - name: Download report CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-report
+          path: .
+
+      - name: Aggregate & mihomo test
+        id: test
+        run: |
+          MAX_PROXIES="${{ github.event.inputs.max_proxies || '0' }}"
+          THRESHOLD="${{ github.event.inputs.latency_threshold || '500' }}"
+
+          python3 aggregate_and_test_proxies.py \
+            --csv report.csv \
+            --out proxy_report.csv \
+            --config config.yaml \
+            --max-proxies "$MAX_PROXIES" \
+            --latency-threshold "$THRESHOLD" \
+            --test-ip \
+            --timeout 15
+
+          if [ -f config.yaml ]; then
+            AVAIL=$(grep -c "^  - name:" config.yaml 2>/dev/null || echo 0)
+            echo "available=$AVAIL" >> "$GITHUB_OUTPUT"
+            echo "✅ $AVAIL proxies passed latency test"
+          else
+            echo "available=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to Cloudflare R2
+        if: steps.test.outputs.available != '0'
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          python3 upload_to_r2.py \
+            --file config.yaml \
+            --bucket "$R2_BUCKET" \
+            --key "$R2_KEY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proxy-results
+          path: |
+            report.csv
+            proxy_report.csv
+            config.yaml
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🌐 Proxy Aggregation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          VALID="${{ needs.fetch-yaml.outputs.valid_urls }}"
+          echo "- YAML URLs found: **${VALID:-0}**" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f proxy_report.csv ]; then
+            TOTAL=$(tail -n +2 proxy_report.csv | wc -l)
+            AVAIL="${{ steps.test.outputs.available }}"
+            echo "- Total proxies: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
+            echo "- Available (latency < threshold): **${AVAIL:-0}**" >> $GITHUB_STEP_SUMMARY
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Proxies by Country" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Country | Code | Count | Avg Latency |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|------|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+
+            awk -F',' 'NR>1 && $8=="True" {
+              key=$5"|"$6; sum[key]+=$7; cnt[key]++
+            } END {
+              for(k in cnt) {
+                split(k,a,"|");
+                printf "| %s | %s | %d | %.0fms |\n", a[1]?a[1]:"Unknown", a[2]?a[2]:"XX", cnt[k], sum[k]/cnt[k]
+              }
+            }' proxy_report.csv | sort -t'|' -k4 -n >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.test.outputs.available }}" != "0" ]; then
+            echo "### ☁️ R2 Upload" >> $GITHUB_STEP_SUMMARY
+            echo "Config published to: \`https://${{ env.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com/${{ env.R2_BUCKET }}/${{ env.R2_KEY }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ No proxies passed latency test" >> $GITHUB_STEP_SUMMARY
+          fi
