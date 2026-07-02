@@ -299,11 +299,14 @@ def geoip_batch(ips: list[str], timeout: float) -> dict[str, dict]:
 def generate_mihomo_config(proxies: list[Proxy], path: str) -> None:
     """Generate mihomo config with external controller enabled."""
     plist = [p.to_dict() for p in proxies]
+    # Sanitize proxy names - remove chars that mihomo might choke on
+    for p in plist:
+        p["name"] = re.sub(r'[^\w\[\]\-\.\s一-鿿]', '_', p["name"])
     config = {
         "mixed-port": 7890,
         "allow-lan": False,
         "mode": "rule",
-        "log-level": "warning",
+        "log-level": "debug",
         "external-controller": f"127.0.0.1:{MIHOMO_API_PORT}",
         "proxies": plist,
         "proxy-groups": [{
@@ -332,27 +335,44 @@ def run_mihomo_latency_test(
     config_dir = os.path.dirname(os.path.abspath(config_path))
     print(f"[INFO] Starting mihomo daemon (config={config_path})...")
 
+    # Log file for mihomo output
+    log_path = os.path.join(config_dir, "mihomo.log")
+    log_fh = open(log_path, "w")
+
     proc = subprocess.Popen(
         ["mihomo", "-d", config_dir, "-f", config_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
     )
 
     latency_map: dict[str, int] = {}
 
     try:
         # Wait for mihomo to be ready
+        started = False
         for attempt in range(30):
+            if proc.poll() is not None:
+                log_fh.flush()
+                print(f"[ERROR] Mihomo exited with code {proc.returncode}")
+                with open(log_path) as f:
+                    print(f"[ERROR] Mihomo log:\n{f.read()[-2000:]}")
+                return {}
+
             try:
                 r = requests.get(f"{MIHOMO_API_BASE}/version", timeout=2)
                 if r.status_code == 200:
                     ver = r.json().get("version", "unknown")
                     print(f"[INFO] Mihomo v{ver} started (pid={proc.pid})")
+                    started = True
                     break
             except Exception:
                 time.sleep(1)
-        else:
+
+        if not started:
             print("[ERROR] Mihomo failed to start within 30s")
+            log_fh.flush()
+            with open(log_path) as f:
+                print(f"[ERROR] Mihomo log:\n{f.read()[-2000:]}")
             proc.terminate()
             return {}
 
