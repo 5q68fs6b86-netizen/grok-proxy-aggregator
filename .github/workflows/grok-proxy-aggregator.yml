@@ -17,6 +17,9 @@ on:
       latency_threshold:
         description: 'Max latency (ms) to keep proxy'
         default: '500'
+      batch_size:
+        description: 'Proxies per mihomo batch'
+        default: '100'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -116,6 +119,7 @@ jobs:
         run: |
           MAX_PROXIES="${{ github.event.inputs.max_proxies || '0' }}"
           THRESHOLD="${{ github.event.inputs.latency_threshold || '500' }}"
+          BATCH="${{ github.event.inputs.batch_size || '100' }}"
 
           python3 scripts/aggregate_and_test_proxies.py \
             --csv report.csv \
@@ -124,7 +128,8 @@ jobs:
             --max-proxies "$MAX_PROXIES" \
             --latency-threshold "$THRESHOLD" \
             --test-ip \
-            --timeout 90
+            --timeout 90 \
+            --batch-size "$BATCH"
 
           if [ -f config.yaml ]; then
             AVAIL=$(grep -c "^  - name:" config.yaml 2>/dev/null || echo 0)
