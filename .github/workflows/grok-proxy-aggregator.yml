@@ -16,7 +16,7 @@ on:
         default: '0'
       latency_threshold:
         description: 'Max latency (ms) to keep proxy'
-        default: '500'
+        default: '1000'
       batch_size:
         description: 'Proxies per mihomo batch'
         default: '100'
