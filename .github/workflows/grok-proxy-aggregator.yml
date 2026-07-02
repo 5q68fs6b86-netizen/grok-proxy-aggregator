@@ -124,7 +124,7 @@ jobs:
             --max-proxies "$MAX_PROXIES" \
             --latency-threshold "$THRESHOLD" \
             --test-ip \
-            --timeout 15
+            --timeout 90
 
           if [ -f config.yaml ]; then
             AVAIL=$(grep -c "^  - name:" config.yaml 2>/dev/null || echo 0)

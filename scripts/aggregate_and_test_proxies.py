@@ -7,7 +7,7 @@ Workflow:
 1. Parse CSV report for status 200 YAML URLs
 2. Download and parse YAML/base64 subscriptions
 3. Deduplicate proxies by (type, server, port, credential)
-4. Generate mihomo config and run latency test
+4. Start mihomo daemon and test latency via REST API
 5. Filter proxies with latency < threshold
 6. GeoIP lookup to determine country
 7. Group working proxies by country
@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -37,6 +38,15 @@ BASE64_PROXY_RE = re.compile(
 )
 
 IP_API_BATCH = "http://ip-api.com/batch"
+MIHOMO_API_PORT = 9090
+MIHOMO_API_BASE = f"http://127.0.0.1:{MIHOMO_API_PORT}"
+
+
+def flag(code: str) -> str:
+    """Country flag emoji from ISO code."""
+    if not code or len(code) != 2:
+        return "🌐"
+    return chr(0x1F1E6 + ord(code[0]) - 65) + chr(0x1F1E6 + ord(code[1]) - 65)
 
 
 @dataclass(frozen=True)
@@ -168,9 +178,14 @@ def parse_base64_proxies(content: str) -> list[dict]:
                 scheme = p.scheme
                 frag = up.unquote(p.fragment) if p.fragment else f"{scheme}-{len(proxies)}"
                 params = up.parse_qs(p.query)
-                cred, hostport = (p.netloc.split("@", 1) + [""])[:2] if "@" in p.netloc else ("", p.netloc)
+                netloc = p.netloc
+                if "@" in netloc:
+                    cred, hostport = netloc.split("@", 1)
+                else:
+                    cred, hostport = "", netloc
                 hp = hostport.rsplit(":", 1)
-                host, port = hp[0], int(hp[1]) if len(hp) > 1 else 443
+                host = hp[0]
+                port = int(hp[1]) if len(hp) > 1 else 443
                 tls_on = params.get("security", [""])[0] == "tls"
                 skip = params.get("allowInsecure", ["0"])[0] == "1"
                 sni = params.get("sni", [""])[0]
@@ -185,8 +200,11 @@ def parse_base64_proxies(content: str) -> list[dict]:
                                     "skip-cert-verify": skip})
                 elif scheme == "ss":
                     import base64
-                    dec = base64.b64decode(cred + "==").decode()
-                    method, pw = dec.split(":", 1)
+                    try:
+                        dec = base64.b64decode(cred + "==").decode()
+                        method, pw = dec.split(":", 1)
+                    except Exception:
+                        method, pw = "aes-256-gcm", cred
                     proxies.append({"name": frag, "type": "ss", "server": host,
                                     "port": port, "password": pw, "cipher": method})
         except Exception as e:
@@ -229,108 +247,224 @@ def normalize(d: dict, idx: int) -> Proxy:
 
 
 def geoip_batch(ips: list[str], timeout: float) -> dict[str, dict]:
+    """Batch GeoIP lookup using ip-api.com (max 100 per request)."""
     result = {}
     for i in range(0, len(ips), 100):
         batch = ips[i:i + 100]
         try:
-            r = requests.post(
-                IP_API_BATCH,
-                json=[{"query": ip, "fields": "status,country,countryCode,city,isp,org,as"}
-                      for ip in batch],
-                timeout=timeout,
-            )
+            payload = [
+                {"query": ip, "fields": "status,country,countryCode,city,isp,org,as,query"}
+                for ip in batch
+            ]
+            r = requests.post(IP_API_BATCH, json=payload, timeout=timeout)
             r.raise_for_status()
-            for e in r.json():
-                if e.get("status") == "success":
-                    result[e["query"]] = {
-                        "country": e.get("country", "Unknown"),
-                        "country_code": e.get("countryCode", "XX"),
-                        "city": e.get("city", ""),
-                        "isp": e.get("isp", ""),
-                        "org": e.get("org", ""),
-                        "as": e.get("as", ""),
+            for entry in r.json():
+                if entry.get("status") == "success":
+                    ip = entry.get("query", "")
+                    result[ip] = {
+                        "country": entry.get("country", "Unknown"),
+                        "country_code": entry.get("countryCode", "XX"),
+                        "city": entry.get("city", ""),
+                        "isp": entry.get("isp", ""),
+                        "org": entry.get("org", ""),
+                        "as": entry.get("as", ""),
                     }
         except Exception as e:
             print(f"  [WARN] GeoIP batch failed: {e}")
+            for ip in batch:
+                try:
+                    r = requests.get(
+                        f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,org,as",
+                        timeout=timeout,
+                    )
+                    r.raise_for_status()
+                    entry = r.json()
+                    if entry.get("status") == "success":
+                        result[ip] = {
+                            "country": entry.get("country", "Unknown"),
+                            "country_code": entry.get("countryCode", "XX"),
+                            "city": entry.get("city", ""),
+                            "isp": entry.get("isp", ""),
+                            "org": entry.get("org", ""),
+                            "as": entry.get("as", ""),
+                        }
+                except Exception:
+                    pass
+                time.sleep(0.5)
         if i + 100 < len(ips):
             time.sleep(1.5)
     return result
 
 
-def mihomo_test(config_path: str) -> dict[str, int]:
-    print("[INFO] Running mihomo latency test...")
-    try:
-        r = subprocess.run(["mihomo", "-t", config_path],
-                           capture_output=True, text=True, timeout=180)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f"[ERROR] mihomo test failed: {e}")
-        return {}
-
-    latency = {}
-    for line in (r.stdout + r.stderr).splitlines():
-        line = line.strip()
-        m = re.match(r"^(.+?):\s+(\d+)\s*ms", line)
-        if m:
-            latency[m.group(1).strip()] = int(m.group(2))
-        m = re.match(r"^(.+?):\s+timeout", line, re.I)
-        if m:
-            latency[m.group(1).strip()] = -1
-    print(f"[INFO] Tested {len(latency)} proxies")
-    return latency
-
-
-def generate_test_config(proxies: list[Proxy], path: str) -> None:
+def generate_mihomo_config(proxies: list[Proxy], path: str) -> None:
+    """Generate mihomo config with external controller enabled."""
     plist = [p.to_dict() for p in proxies]
     config = {
-        "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "info",
+        "mixed-port": 7890,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "warning",
+        "external-controller": f"127.0.0.1:{MIHOMO_API_PORT}",
         "proxies": plist,
         "proxy-groups": [{
-            "name": "Auto-Test", "type": "url-test",
+            "name": "ALL",
+            "type": "url-test",
             "proxies": [p["name"] for p in plist],
             "url": "http://www.gstatic.com/generate_204",
-            "interval": 300, "tolerance": 50,
+            "interval": 60,
+            "tolerance": 50,
         }],
-        "rules": ["MATCH,Auto-Test"],
+        "rules": ["MATCH,ALL"],
     }
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
-    print(f"[INFO] Test config: {path} ({len(proxies)} proxies)")
+    print(f"[INFO] Mihomo config: {path} ({len(proxies)} proxies)")
+
+
+def run_mihomo_latency_test(
+    config_path: str,
+    timeout: float = 120,
+) -> dict[str, int]:
+    """
+    Start mihomo daemon, trigger url-test via API, collect latency, then stop.
+    Returns {proxy_name: latency_ms}.
+    """
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    print(f"[INFO] Starting mihomo daemon (config={config_path})...")
+
+    proc = subprocess.Popen(
+        ["mihomo", "-d", config_dir, "-f", config_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    latency_map: dict[str, int] = {}
+
+    try:
+        # Wait for mihomo to be ready
+        for attempt in range(30):
+            try:
+                r = requests.get(f"{MIHOMO_API_BASE}/version", timeout=2)
+                if r.status_code == 200:
+                    ver = r.json().get("version", "unknown")
+                    print(f"[INFO] Mihomo v{ver} started (pid={proc.pid})")
+                    break
+            except Exception:
+                time.sleep(1)
+        else:
+            print("[ERROR] Mihomo failed to start within 30s")
+            proc.terminate()
+            return {}
+
+        # Get list of all proxies
+        try:
+            r = requests.get(f"{MIHOMO_API_BASE}/proxies", timeout=10)
+            r.raise_for_status()
+            proxies_data = r.json()
+            all_names = [
+                name for name in proxies_data.get("proxies", {}).keys()
+                if name not in ("GLOBAL", "DIRECT", "REJECT", "ALL")
+            ]
+            print(f"[INFO] Registered {len(all_names)} proxies")
+        except Exception as e:
+            print(f"[ERROR] Failed to list proxies: {e}")
+            proc.terminate()
+            return {}
+
+        # Trigger url-test on ALL group
+        print("[INFO] Triggering url-test on ALL group...")
+        try:
+            url = f"{MIHOMO_API_BASE}/proxies/ALL"
+            params = {"timeout": 5000, "url": "http://www.gstatic.com/generate_204"}
+            r = requests.put(url, params=params, timeout=10)
+            print(f"[INFO] url-test trigger: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[WARN] url-test trigger failed: {e}")
+
+        # Wait for tests to run
+        test_timeout = min(timeout, 90)
+        print(f"[INFO] Waiting {test_timeout}s for latency tests...")
+        time.sleep(test_timeout)
+
+        # Collect results
+        print("[INFO] Collecting latency results...")
+        for name in all_names:
+            try:
+                encoded = requests.utils.quote(name, safe="")
+                r = requests.get(f"{MIHOMO_API_BASE}/proxies/{encoded}", timeout=3)
+                if r.status_code == 200:
+                    history = r.json().get("history", [])
+                    if history:
+                        delay = history[-1].get("delay", 0)
+                        if delay > 0:
+                            latency_map[name] = delay
+            except Exception:
+                pass
+
+        print(f"[INFO] Collected latency for {len(latency_map)}/{len(all_names)} proxies")
+
+    finally:
+        print("[INFO] Stopping mihomo daemon...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    return latency_map
 
 
 def generate_final_config(groups: dict[str, CountryGroup], all_proxies: list[Proxy], path: str) -> None:
+    """Generate final mihomo config grouped by country."""
     proxy_list = [p.to_dict() for p in all_proxies]
     glist = []
+
     for code in sorted(groups, key=lambda c: groups[c].avg_latency):
         g = groups[code]
         if g.proxies:
             glist.append({
-                "name": f"🌐 {g.name}", "type": "url-test",
+                "name": f"{flag(code)} {g.name}",
+                "type": "url-test",
                 "proxies": [p.name for p in g.proxies],
                 "url": "http://www.gstatic.com/generate_204",
-                "interval": 300, "tolerance": 50,
+                "interval": 300,
+                "tolerance": 50,
             })
+
     glist.insert(0, {
-        "name": "🚀 Auto-Select", "type": "url-test",
+        "name": "🚀 Auto-Select",
+        "type": "url-test",
         "proxies": [p.name for p in all_proxies],
         "url": "http://www.gstatic.com/generate_204",
-        "interval": 300, "tolerance": 50,
+        "interval": 300,
+        "tolerance": 50,
     })
+
     glist.append({
-        "name": "🐟 Fallback", "type": "select",
+        "name": "🐟 Fallback",
+        "type": "select",
         "proxies": ["DIRECT"] + [p.name for p in all_proxies],
     })
+
     config = {
-        "mixed-port": 7890, "allow-lan": False, "mode": "rule",
-        "log-level": "info", "ipv6": False,
-        "proxies": proxy_list, "proxy-groups": glist,
+        "mixed-port": 7890,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "info",
+        "ipv6": False,
+        "proxies": proxy_list,
+        "proxy-groups": glist,
         "rules": [
             "DOMAIN-SUFFIX,google.com,🚀 Auto-Select",
             "DOMAIN-SUFFIX,github.com,🚀 Auto-Select",
+            "DOMAIN-SUFFIX,githubusercontent.com,🚀 Auto-Select",
             "DOMAIN-SUFFIX,youtube.com,🚀 Auto-Select",
             "DOMAIN-SUFFIX,twitter.com,🚀 Auto-Select",
             "DOMAIN-SUFFIX,x.com,🚀 Auto-Select",
             "DOMAIN-SUFFIX,telegram.org,🚀 Auto-Select",
             "DOMAIN-SUFFIX,openai.com,🚀 Auto-Select",
+            "DOMAIN-SUFFIX,anthropic.com,🚀 Auto-Select",
             "GEOIP,CN,DIRECT",
             "MATCH,🐟 Fallback",
         ],
@@ -371,12 +505,13 @@ def main() -> int:
         return 0
     if args.max_proxies > 0:
         all_proxies = all_proxies[:args.max_proxies]
+        print(f"  Limited to {len(all_proxies)} proxies")
 
-    # Step 3: Generate test config & run mihomo
+    # Step 3: Generate config & run mihomo latency test
     print(f"\n[STEP 3] Mihomo latency test...")
-    tmp = "/tmp/mihomo_test.yaml"
-    generate_test_config(all_proxies, tmp)
-    latency = mihomo_test(tmp)
+    tmp_config = "/tmp/mihomo_test.yaml"
+    generate_mihomo_config(all_proxies, tmp_config)
+    latency = run_mihomo_latency_test(tmp_config, timeout=args.timeout)
 
     # Step 4: GeoIP
     print(f"\n[STEP 4] GeoIP lookup...")
@@ -405,15 +540,18 @@ def main() -> int:
             available.append(p)
     for g in groups.values():
         g.proxies.sort(key=lambda p: latency.get(p.name, 9999))
-        g.avg_latency = sum(latency.get(p.name, 0) for p in g.proxies) / len(g.proxies) if g.proxies else 0
+        g.avg_latency = (
+            sum(latency.get(p.name, 0) for p in g.proxies) / len(g.proxies)
+            if g.proxies else 0
+        )
 
     print(f"  Available: {len(available)}/{len(all_proxies)}")
     for code in sorted(groups, key=lambda c: groups[c].avg_latency):
         g = groups[code]
-        print(f"    [{code}] {g.name}: {len(g.proxies)} proxies, avg {g.avg_latency:.0f}ms")
+        print(f"    {flag(code)} [{code}] {g.name}: {len(g.proxies)} proxies, avg {g.avg_latency:.0f}ms")
 
     if not available:
-        print("[WARN] No proxies passed.")
+        print("[WARN] No proxies passed latency test.")
         return 0
 
     # Step 6: Generate final config
@@ -434,9 +572,14 @@ def main() -> int:
                         lat if lat > 0 else "", 0 < lat <= args.latency_threshold,
                         geo.get("isp", ""), geo.get("org", "")])
 
-    print(f"\n{'='*60}\nDONE\n{'='*60}")
-    print(f"  Total: {len(all_proxies)}, Available: {len(available)}")
-    print(f"  Countries: {len(groups)}, Config: {args.config}")
+    print(f"\n{'='*60}")
+    print(f"DONE")
+    print(f"{'='*60}")
+    print(f"  Total: {len(all_proxies)}")
+    print(f"  Available: {len(available)}")
+    print(f"  Countries: {len(groups)}")
+    print(f"  Config: {args.config}")
+    print(f"  Report: {args.out}")
     return 0
 
 
