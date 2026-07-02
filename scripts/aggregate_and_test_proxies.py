@@ -299,9 +299,16 @@ def geoip_batch(ips: list[str], timeout: float) -> dict[str, dict]:
 def generate_mihomo_config(proxies: list[Proxy], path: str) -> None:
     """Generate mihomo config with external controller enabled."""
     plist = [p.to_dict() for p in proxies]
-    # Sanitize proxy names - remove chars that mihomo might choke on
+    # Sanitize proxy names - keep only safe chars
     for p in plist:
-        p["name"] = re.sub(r'[^\w\[\]\-\.\s一-鿿]', '_', p["name"])
+        # Replace emojis and special chars, keep CJK
+        name = p["name"]
+        name = re.sub(r'[^\w\[\]\-\.\s一-鿿]', '_', name)
+        name = re.sub(r'_+', '_', name).strip('_')
+        if not name:
+            name = f"{p['type']}-{p['server'][:8]}"
+        p["name"] = name
+
     config = {
         "mixed-port": 7890,
         "allow-lan": False,
