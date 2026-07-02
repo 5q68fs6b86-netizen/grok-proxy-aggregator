@@ -46,7 +46,7 @@ jobs:
           cache: 'pip'
 
       - name: Install deps
-        run: pip install requests pyyaml
+        run: pip install -r scripts/requirements.txt
 
       - name: Run Grok script
         id: grok
@@ -56,11 +56,11 @@ jobs:
           BASE_URL="${{ github.event.inputs.base_url || 'https://jiuuij.de5.net/v1' }}"
           MODEL="${{ github.event.inputs.model || 'grok-4.20-multi-agent-xhigh' }}"
 
-          python3 grok_authorized_yaml_report.py \
+          python3 scripts/grok_authorized_yaml_report.py \
             --base-url "$BASE_URL" \
             --model "$MODEL" \
             --no-host-filter \
-            --prompt-file searchprompt.txt \
+            --prompt-file scripts/searchprompt.txt \
             --out report.csv \
             --timeout 120
 
@@ -92,7 +92,7 @@ jobs:
           cache: 'pip'
 
       - name: Install deps
-        run: pip install requests pyyaml boto3
+        run: pip install -r scripts/requirements.txt
 
       - name: Install mihomo
         run: |
@@ -117,7 +117,7 @@ jobs:
           MAX_PROXIES="${{ github.event.inputs.max_proxies || '0' }}"
           THRESHOLD="${{ github.event.inputs.latency_threshold || '500' }}"
 
-          python3 aggregate_and_test_proxies.py \
+          python3 scripts/aggregate_and_test_proxies.py \
             --csv report.csv \
             --out proxy_report.csv \
             --config config.yaml \
@@ -141,7 +141,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          python3 upload_to_r2.py \
+          python3 scripts/upload_to_r2.py \
             --file config.yaml \
             --bucket "$R2_BUCKET" \
             --key "$R2_KEY"
